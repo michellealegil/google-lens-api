@@ -182,34 +182,45 @@ pool: Optional[BrowserPool] = None
 
 async def get_search_url(image_url: str) -> str:
     """
-    Hit lens.google.com/uploadbyurl and follow the redirect to get
-    the google.com/search URL with vsrid + udm=26.
-    Returns the full search URL ready to render.
+    Navigate to lens.google.com/uploadbyurl in a real Playwright browser,
+    follow the redirect to get the google.com/search URL with vsrid + udm=26.
+    Uses the browser pool — much better CAPTCHA resistance than raw httpx.
     """
+    if pool is None:
+        raise RuntimeError("Browser pool not initialized")
+
     lens_url = f"https://lens.google.com/uploadbyurl?url={quote(image_url, safe='')}"
 
-    # Use HTTPX_PROXY for the httpx step — cloud IPs get CAPTCHA'd by Google on raw requests.
-    # Kept separate from PROXY_LIST (Playwright) because MrScraper's HTTP proxy crashes Chromium.
-    httpx_proxy = os.environ.get("HTTPX_PROXY") or (proxy_rotator.next() if proxy_rotator else None)
-    async with httpx.AsyncClient(
-        headers=CHROME_HEADERS,
-        follow_redirects=True,
-        timeout=httpx.Timeout(20.0),
-        proxy=httpx_proxy,
-    ) as client:
-        resp = await client.get(lens_url)
-        final_url = str(resp.url)
+    try:
+        from playwright_stealth import stealth_async
+        USE_STEALTH = True
+    except ImportError:
+        USE_STEALTH = False
 
-        if "sorry/index" in final_url:
-            raise ValueError("Google returned CAPTCHA page for Lens request — IP may be flagged")
+    async with pool.acquire() as context:
+        page = await context.new_page()
+        try:
+            if USE_STEALTH:
+                await stealth_async(page)
 
-        if "google.com/search" not in final_url or "vsrid" not in final_url:
-            raise ValueError(f"Lens redirect did not land on search page. Got: {final_url[:200]}")
+            await page.goto(lens_url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(random.uniform(1.0, 2.0))
 
-        # Ensure udm=26 (Exact Match tab)
-        search_url = _set_param(final_url, "udm", "26")
-        print(f"[httpx] Got search URL: {search_url[:120]}...")
-        return search_url
+            final_url = page.url
+            print(f"[playwright] Redirected to: {final_url[:120]}...")
+
+            if "sorry/index" in final_url:
+                raise ValueError("Google returned CAPTCHA page for Lens request — IP may be flagged")
+
+            if "google.com/search" not in final_url or "vsrid" not in final_url:
+                raise ValueError(f"Lens redirect did not land on search page. Got: {final_url[:200]}")
+
+            search_url = _set_param(final_url, "udm", "26")
+            print(f"[playwright] Got search URL: {search_url[:120]}...")
+            return search_url
+
+        finally:
+            await page.close()
 
 
 def _set_param(url: str, key: str, value: str) -> str:
@@ -269,13 +280,14 @@ async def render_url(search_url: str) -> str:
 
 async def get_exact_match_html(image_url: str, proxy: Optional[str] = None) -> str:
     """
-    Full hybrid flow:
-      1. httpx → get direct search URL with vsrid
-      2. Playwright pool → render that URL → return HTML
+    Full Playwright flow:
+      1. Playwright → navigate to lens.google.com/uploadbyurl → follow redirect → get vsrid URL
+      2. Playwright → render that URL with JS → return HTML
+    Both steps use the browser pool for CAPTCHA resistance.
     """
     await asyncio.sleep(random.uniform(0.2, 0.8))
 
-    # Step 1: get URL via httpx (fast, no browser)
+    # Step 1: get search URL via browser (avoids CAPTCHA vs raw httpx)
     search_url = await get_search_url(image_url)
 
     # Step 2: render via pooled browser
