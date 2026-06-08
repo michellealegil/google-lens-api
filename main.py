@@ -8,8 +8,17 @@ Returns the raw HTML of the Google Lens Exact Match results page.
 """
 
 import os
+import sys
+import subprocess
 import asyncio
 from contextlib import asynccontextmanager
+
+# Install Playwright browsers at startup (needed on Render — ephemeral container)
+print("[startup] Installing Playwright Chromium...")
+subprocess.run(
+    [sys.executable, "-m", "playwright", "install", "chromium"],
+    check=True
+)
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
