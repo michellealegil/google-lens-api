@@ -21,16 +21,12 @@ from scraper import BrowserPool, get_exact_match_html
 
 POOL_SIZE = int(os.getenv("POOL_SIZE", "3"))
 
-# Comma-separated list of proxy URLs
-# e.g. PROXY_LIST="http://user:pass@host1:port,http://user:pass@host2:port"
 _proxy_list_raw = os.getenv("PROXY_LIST", "")
 PROXY_LIST = [p.strip() for p in _proxy_list_raw.split(",") if p.strip()]
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Start browser pool on startup, shut it down on exit."""
-    # Install Playwright Chromium here (after port is bound) so Render doesn't time out
+async def _initialize():
+    """Install Chromium and start browser pool in the background."""
     print("[startup] Installing Playwright Chromium...")
     await asyncio.get_event_loop().run_in_executor(
         None,
@@ -49,8 +45,16 @@ async def lifespan(app: FastAPI):
 
     scraper.pool = BrowserPool(size=POOL_SIZE)
     await scraper.pool.start()
+    print("[startup] Ready")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Kick off init as background task — port binds immediately, no timeout
+    asyncio.create_task(_initialize())
     yield
-    await scraper.pool.stop()
+    if scraper.pool:
+        await scraper.pool.stop()
 
 
 app = FastAPI(
@@ -68,6 +72,9 @@ async def google_lens(
     if not imageUrl.startswith("http"):
         raise HTTPException(status_code=400, detail="imageUrl must be a valid HTTP/HTTPS URL")
 
+    if scraper.pool is None:
+        raise HTTPException(status_code=503, detail="Service is warming up — try again in 60 seconds")
+
     try:
         html = await get_exact_match_html(imageUrl)
         return HTMLResponse(content=html, status_code=200)
@@ -84,8 +91,8 @@ async def google_lens(
 
 @app.get("/health")
 async def health():
-    pool_size = scraper.pool.size if scraper.pool else 0
-    return JSONResponse({"status": "ok", "pool_size": pool_size})
+    ready = scraper.pool is not None
+    return JSONResponse({"status": "ready" if ready else "warming_up", "pool_size": scraper.pool.size if ready else 0})
 
 
 @app.get("/")
