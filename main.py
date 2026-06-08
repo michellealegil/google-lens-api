@@ -13,13 +13,6 @@ import subprocess
 import asyncio
 from contextlib import asynccontextmanager
 
-# Install Playwright browsers at startup (needed on Render — ephemeral container)
-print("[startup] Installing Playwright Chromium...")
-subprocess.run(
-    [sys.executable, "-m", "playwright", "install", "chromium"],
-    check=True
-)
-
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
@@ -37,6 +30,17 @@ PROXY_LIST = [p.strip() for p in _proxy_list_raw.split(",") if p.strip()]
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start browser pool on startup, shut it down on exit."""
+    # Install Playwright Chromium here (after port is bound) so Render doesn't time out
+    print("[startup] Installing Playwright Chromium...")
+    await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=True
+        )
+    )
+    print("[startup] Chromium ready")
+
     if PROXY_LIST:
         scraper.proxy_rotator = scraper.ProxyRotator(PROXY_LIST)
         print(f"[proxies] Loaded {len(PROXY_LIST)} proxies")
