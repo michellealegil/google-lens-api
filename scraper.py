@@ -13,6 +13,7 @@ Why hybrid:
   - Browser pool means we reuse browsers across requests — faster + concurrent
 """
 
+import os
 import asyncio
 import random
 import re
@@ -187,13 +188,14 @@ async def get_search_url(image_url: str) -> str:
     """
     lens_url = f"https://lens.google.com/uploadbyurl?url={quote(image_url, safe='')}"
 
-    # Use proxy for httpx too — cloud IPs (Render, AWS, etc.) get CAPTCHA'd by Google
-    proxy_url = proxy_rotator.next() if proxy_rotator else None
+    # Use HTTPX_PROXY for the httpx step — cloud IPs get CAPTCHA'd by Google on raw requests.
+    # Kept separate from PROXY_LIST (Playwright) because MrScraper's HTTP proxy crashes Chromium.
+    httpx_proxy = os.environ.get("HTTPX_PROXY") or (proxy_rotator.next() if proxy_rotator else None)
     async with httpx.AsyncClient(
         headers=CHROME_HEADERS,
         follow_redirects=True,
         timeout=httpx.Timeout(20.0),
-        proxy=proxy_url,
+        proxy=httpx_proxy,
     ) as client:
         resp = await client.get(lens_url)
         final_url = str(resp.url)
