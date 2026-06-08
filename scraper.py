@@ -187,12 +187,13 @@ async def get_search_url(image_url: str) -> str:
     """
     lens_url = f"https://lens.google.com/uploadbyurl?url={quote(image_url, safe='')}"
 
-    # httpx does NOT use proxy — direct connection works fine for Lens URL extraction
-    # (proxy is reserved for Playwright rendering where it matters most)
+    # Use proxy for httpx too — cloud IPs (Render, AWS, etc.) get CAPTCHA'd by Google
+    proxy_url = proxy_rotator.next() if proxy_rotator else None
     async with httpx.AsyncClient(
         headers=CHROME_HEADERS,
         follow_redirects=True,
         timeout=httpx.Timeout(20.0),
+        proxy=proxy_url,
     ) as client:
         resp = await client.get(lens_url)
         final_url = str(resp.url)
