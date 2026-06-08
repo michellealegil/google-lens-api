@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: google-lens-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt && PLAYWRIGHT_BROWSERS_PATH=/opt/render/project/src/.playwright python3 -m playwright install chromium --with-deps
+    startCommand: python3 -m uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: /opt/render/project/src/.playwright
+      - key: POOL_SIZE
+        value: "1"
