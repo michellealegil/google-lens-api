@@ -11,6 +11,7 @@ import os
 import sys
 import subprocess
 import asyncio
+import traceback
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Query, HTTPException
@@ -86,7 +87,8 @@ async def google_lens(
         raise HTTPException(status_code=504, detail="Request timed out")
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {type(e).__name__}: {str(e)}")
 
 
 @app.get("/health")

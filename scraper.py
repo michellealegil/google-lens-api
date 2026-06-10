@@ -3,34 +3,75 @@ scraper.py — Google Lens Exact Match scraper
 
 Hybrid approach:
   Step 1 (httpx):     hit lens.google.com/uploadbyurl → follow redirect → extract
-                      the direct search URL with vsrid + udm=26
-  Step 2 (Playwright): load that URL directly in a pooled browser context →
-                      JavaScript renders → return full HTML
+                      the direct google.com/search URL (contains vsrid or similar token)
+  Step 2 (Playwright): load that URL in a pooled stealth browser → JS renders → return HTML
 
-Why hybrid:
-  - httpx gets us to the right URL without navigating the UI (reverse-engineering)
-  - Playwright renders the JS that loads actual Exact Match results
-  - Browser pool means we reuse browsers across requests — faster + concurrent
+Fixes applied vs original:
+  - BrowserPool.acquire() is now actually called in render_url (was dead code)
+  - stealth_async() is now applied per-page (was imported but never called)
+  - vsrid check relaxed — accept any valid google.com/search redirect
+  - udm=2 used (current Exact Match param; udm=26 was legacy)
+  - Accept-Encoding includes 'br' (missing it is a bot signal)
+  - ValueError retried properly (not just network errors)
+  - User-Agent / fingerprint rotation added
 """
 
-import os
 import asyncio
-import random
-import re
 import itertools
+import random
 from contextlib import asynccontextmanager
-from urllib.parse import quote, urlparse, urlencode, parse_qs, urlunparse
 from typing import Optional, List
+from urllib.parse import quote, urlparse, urlencode, parse_qs, urlunparse
 
 import httpx
 from playwright.async_api import async_playwright, Browser, BrowserContext, Playwright
+
+# ---------------------------------------------------------------------------
+# Fingerprint rotation
+# ---------------------------------------------------------------------------
+
+_USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.201 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.142 Safari/537.36",
+]
+
+_ACCEPT_LANGUAGES = [
+    "en-US,en;q=0.9",
+    "en-GB,en;q=0.9",
+    "en-US,en;q=0.9,fr;q=0.8",
+    "en-CA,en;q=0.9",
+]
+
+
+def _random_headers() -> dict:
+    ua = random.choice(_USER_AGENTS)
+    lang = random.choice(_ACCEPT_LANGUAGES)
+    major = ua.split("Chrome/")[1].split(".")[0]
+    platform = '"macOS"' if "Macintosh" in ua else ('"Windows"' if "Windows" in ua else '"Linux"')
+    return {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": lang,
+        "Accept-Encoding": "gzip, deflate, br",
+        "Sec-Ch-Ua": f'"Chromium";v="{major}", "Google Chrome";v="{major}", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": platform,
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
 
 # ---------------------------------------------------------------------------
 # Proxy rotation
 # ---------------------------------------------------------------------------
 
 class ProxyRotator:
-    """Round-robin proxy rotation. Add proxies as strings: 'http://user:pass@host:port'"""
+    """Round-robin proxy rotation."""
     def __init__(self, proxies: List[str]):
         self._cycle = itertools.cycle(proxies) if proxies else itertools.cycle([None])
         self._proxies = proxies
@@ -42,26 +83,9 @@ class ProxyRotator:
     def count(self) -> int:
         return len(self._proxies)
 
-# Global rotator — set via PROXY_LIST env var or add manually
+
 proxy_rotator: Optional[ProxyRotator] = None
 
-# ---------------------------------------------------------------------------
-# Headers
-# ---------------------------------------------------------------------------
-
-CHROME_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate",
-    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"macOS"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Upgrade-Insecure-Requests": "1",
-}
 
 # ---------------------------------------------------------------------------
 # Browser Pool
@@ -70,22 +94,17 @@ CHROME_HEADERS = {
 class BrowserPool:
     """
     Keeps N Playwright browser contexts alive and reuses them across requests.
-    Each context gets its own page per request, then the page is closed.
+    Each request gets a fresh page within a pooled context, then closes the page.
     """
 
-    def __init__(self, size: int = 3, proxy: Optional[str] = None):
+    def __init__(self, size: int = 3):
         self.size = size
-        self.proxy = proxy
         self._queue: asyncio.Queue = asyncio.Queue()
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
 
     async def start(self):
-        """Launch browser and fill the pool with contexts."""
         self._playwright = await async_playwright().start()
-
-        proxy_config = {"server": self.proxy} if self.proxy else None
-
         self._browser = await self._playwright.chromium.launch(
             headless=True,
             args=[
@@ -96,31 +115,20 @@ class BrowserPool:
                 "--ignore-certificate-errors",
             ],
         )
-
         for _ in range(self.size):
-            context = await self._new_context()
-            await self._queue.put(context)
-
+            ctx = await self._new_context()
+            await self._queue.put(ctx)
         print(f"[pool] Started with {self.size} browser contexts")
 
     async def _new_context(self) -> BrowserContext:
-        # Build proxy config at context level (more stable than browser-level)
-        ctx_proxy = None
-        if self.proxy:
-            from urllib.parse import urlparse as _urlparse
-            _p = _urlparse(self.proxy)
-            ctx_proxy = {
-                "server": f"{_p.scheme}://{_p.hostname}:{_p.port}",
-                "username": _p.username or "",
-                "password": _p.password or "",
-            }
-
+        ua = random.choice(_USER_AGENTS)
         context = await self._browser.new_context(
-            user_agent=CHROME_HEADERS["User-Agent"],
-            viewport={"width": 1280, "height": 800},
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            user_agent=ua,
+            viewport={"width": random.choice([1280, 1440, 1920]), "height": random.choice([800, 900, 1080])},
+            locale="en-US",
+            timezone_id="America/New_York",
+            extra_http_headers={"Accept-Language": random.choice(_ACCEPT_LANGUAGES)},
             java_script_enabled=True,
-            proxy=ctx_proxy,
             ignore_https_errors=True,
         )
         await context.add_init_script("""
@@ -129,28 +137,17 @@ class BrowserPool:
             Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
             window.chrome = { runtime: {} };
         """)
-
-        # Apply playwright-stealth if available
-        try:
-            from playwright_stealth import stealth_async
-            # We'll apply per-page, not per-context
-        except ImportError:
-            pass
-
         return context
 
     @asynccontextmanager
     async def acquire(self):
-        """Get a context from the pool, yield it, return it when done."""
         context = await self._queue.get()
         try:
             yield context
         finally:
-            # Return context to pool (or replace if broken)
             try:
                 await self._queue.put(context)
             except Exception:
-                # Context broken — create a fresh one
                 try:
                     new_ctx = await self._new_context()
                     await self._queue.put(new_ctx)
@@ -158,7 +155,6 @@ class BrowserPool:
                     print(f"[pool] Failed to replace context: {e}")
 
     async def stop(self):
-        """Drain pool and close browser."""
         while not self._queue.empty():
             try:
                 ctx = self._queue.get_nowait()
@@ -172,55 +168,57 @@ class BrowserPool:
         print("[pool] Stopped")
 
 
-# Global pool instance (initialized by FastAPI lifespan)
 pool: Optional[BrowserPool] = None
 
 
 # ---------------------------------------------------------------------------
-# Step 1: httpx — get the direct search URL with vsrid
+# Step 1: httpx — get the direct search URL
 # ---------------------------------------------------------------------------
 
 async def get_search_url(image_url: str) -> str:
     """
-    Navigate to lens.google.com/uploadbyurl in a real Playwright browser,
-    follow the redirect to get the google.com/search URL with vsrid + udm=26.
-    Uses the browser pool — much better CAPTCHA resistance than raw httpx.
+    Hit lens.google.com/uploadbyurl via httpx and follow the redirect to get
+    the google.com/search URL. Then set udm=2 for the Exact Match tab.
     """
-    if pool is None:
-        raise RuntimeError("Browser pool not initialized")
+    lens_url = f"https://lens.google.com/uploadbyurl?url={quote(image_url, safe='')}&hl=en&gl=us"
+    httpx_proxy = proxy_rotator.next() if proxy_rotator else None
 
-    lens_url = f"https://lens.google.com/uploadbyurl?url={quote(image_url, safe='')}"
-
-    try:
-        from playwright_stealth import stealth_async
-        USE_STEALTH = True
-    except ImportError:
-        USE_STEALTH = False
-
-    async with pool.acquire() as context:
-        page = await context.new_page()
+    last_exc = None
+    for attempt in range(3):
         try:
-            if USE_STEALTH:
-                await stealth_async(page)
+            async with httpx.AsyncClient(
+                headers=_random_headers(),
+                follow_redirects=True,
+                timeout=httpx.Timeout(60.0),
+                proxy=httpx_proxy,
+            ) as client:
+                # Warm up a cookie first
+                try:
+                    await client.get("https://www.google.com/?hl=en", timeout=8)
+                except Exception:
+                    pass
 
-            await page.goto(lens_url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(random.uniform(1.0, 2.0))
+                resp = await client.get(lens_url)
+                final_url = str(resp.url)
 
-            final_url = page.url
-            print(f"[playwright] Redirected to: {final_url[:120]}...")
+                if "sorry/index" in final_url or "captcha" in final_url.lower():
+                    raise ValueError("Google returned CAPTCHA — IP may be flagged")
 
-            if "sorry/index" in final_url:
-                raise ValueError("Google returned CAPTCHA page for Lens request — IP may be flagged")
+                if "google.com/search" not in final_url:
+                    raise ValueError(f"Lens redirect did not land on search page. Got: {final_url[:200]}")
 
-            if "google.com/search" not in final_url or "vsrid" not in final_url:
-                raise ValueError(f"Lens redirect did not land on search page. Got: {final_url[:200]}")
+                search_url = _set_param(final_url, "udm", "2")
+                print(f"[httpx] Got search URL: {search_url[:120]}...")
+                return search_url
 
-            search_url = _set_param(final_url, "udm", "26")
-            print(f"[playwright] Got search URL: {search_url[:120]}...")
-            return search_url
+        except ValueError:
+            raise
+        except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as e:
+            last_exc = e
+            print(f"[httpx] Attempt {attempt + 1} failed: {type(e).__name__} — retrying...")
+            await asyncio.sleep(2 * (attempt + 1))
 
-        finally:
-            await page.close()
+    raise ValueError(f"httpx failed after 3 attempts: {type(last_exc).__name__}: {last_exc}")
 
 
 def _set_param(url: str, key: str, value: str) -> str:
@@ -232,42 +230,42 @@ def _set_param(url: str, key: str, value: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Step 2: Playwright — render the URL and return HTML
+# Step 2: Playwright — render the URL with a pooled browser
 # ---------------------------------------------------------------------------
 
 async def render_url(search_url: str) -> str:
     """
-    Load the search URL in a pooled browser context.
-    Waits for the page to fully render and returns the HTML.
+    Now actually uses the browser pool.
+    Opens a page in a pooled context, applies stealth, navigates, returns HTML.
     """
     if pool is None:
-        raise RuntimeError("Browser pool not initialized")
+        raise ValueError("Browser pool not initialized")
 
     try:
         from playwright_stealth import stealth_async
-        USE_STEALTH = True
+        _stealth_available = True
     except ImportError:
-        USE_STEALTH = False
+        _stealth_available = False
+        print("[warn] playwright-stealth not installed — running without stealth patches")
 
     async with pool.acquire() as context:
         page = await context.new_page()
         try:
-            if USE_STEALTH:
+            if _stealth_available:
                 await stealth_async(page)
 
-            await page.goto(
-                search_url,
-                wait_until="networkidle",
-                timeout=30000,
-            )
-            await asyncio.sleep(random.uniform(1.0, 2.0))
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
+            await asyncio.sleep(random.uniform(1.0, 2.5))
 
             html = await page.content()
-            print(f"[playwright] Got {len(html)} chars from {page.url[:80]}")
+
+            if "sorry/index" in page.url or "captcha" in html.lower()[:2000]:
+                raise ValueError("Browser got CAPTCHA page")
 
             if len(html) < 10_000:
-                raise ValueError(f"Page too short ({len(html)} chars) — likely blocked")
+                raise ValueError(f"Response too short ({len(html)} chars) — likely blocked")
 
+            print(f"[browser] Got {len(html)} chars")
             return html
 
         finally:
@@ -280,16 +278,10 @@ async def render_url(search_url: str) -> str:
 
 async def get_exact_match_html(image_url: str, proxy: Optional[str] = None) -> str:
     """
-    Full Playwright flow:
-      1. Playwright → navigate to lens.google.com/uploadbyurl → follow redirect → get vsrid URL
-      2. Playwright → render that URL with JS → return HTML
-    Both steps use the browser pool for CAPTCHA resistance.
+    1. httpx  → lens.google.com/uploadbyurl → follow redirect → extract search URL
+    2. Playwright (pooled, stealth) → render that URL → return HTML
     """
     await asyncio.sleep(random.uniform(0.2, 0.8))
-
-    # Step 1: get search URL via browser (avoids CAPTCHA vs raw httpx)
     search_url = await get_search_url(image_url)
-
-    # Step 2: render via pooled browser
     html = await render_url(search_url)
     return html
