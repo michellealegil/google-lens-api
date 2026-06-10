@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+
+# Test/debug artifacts
+*.html
+investigate.py
+test_*.py
+MEMORY.md
+CHALLENGE.md

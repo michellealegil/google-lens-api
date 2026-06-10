@@ -20,7 +20,7 @@ Google processes the image and redirects to a `google.com/search` URL containing
 
 **Step 2 — Render the Exact Match page (Playwright browser pool)**
 
-We append `udm=26` to the search URL (Google's parameter for the Exact Match tab) and load it in a pooled stealth browser. JavaScript executes, the results render, and we return the full HTML.
+We append `udm=2` to the search URL (Google's parameter for the Exact Match tab) and load it in a pooled stealth browser. JavaScript executes, the results render, and we return the full HTML.
 
 This is significantly faster than full UI navigation (no clicking through the Lens interface) and produces complete, JS-rendered results.
 
@@ -127,7 +127,7 @@ Returns API info and usage example.
 
 **Request:**
 ```bash
-curl "https://your-api.com/google-lens?imageUrl=https://i.ebayimg.com/00/s/MTYwMFgxNjAw/z/BVcAAOSwS-9m4zOb/%24_57.JPG"
+curl "https://google-lens-api-4qrj.onrender.com/google-lens?imageUrl=https://i.ebayimg.com/00/s/MTYwMFgxNjAw/z/BVcAAOSwS-9m4zOb/%24_57.JPG"
 ```
 
 **Response:** Full HTML string of the Google Lens Exact Match page (typically 300K–1.7MB), containing links to pages where the exact image appears.
